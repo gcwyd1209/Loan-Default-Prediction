@@ -1,0 +1,1472 @@
+---
+title: "Loan Default Prediction for Evergreen National Bank"
+author: "Group 1 Data Science Consultants"
+date: "12/1/2024"
+output: html_document
+---
+
+## Introduction
+
+This report outlines the development of a **Predictive Loan Default Model** for Evergreen National Bank using the PKDD'99 Berka dataset. The model leverages advanced data science techniques to:
+
+- Identify high-risk loan applicants.
+- Enhance credit risk management.
+- Support operational efficiency and decision-making.
+
+The final deliverable includes a trained machine learning model, visualizations, and actionable recommendations for proactive credit risk management.
+
+---
+
+## Objectives
+
+1. **Proactive Risk Management**: Identify high-risk borrowers early to reduce financial losses.
+2. **Decision Support**: Automate decision-making using data-driven insights.
+3. **Efficiency Improvement**: Optimize resource allocation by focusing on risky segments.
+4. **Customer Retention**: Provide tailored loan offerings for different borrower segments.
+
+---
+
+## Data Overview
+
+The dataset consists of interconnected tables that capture accounts, clients, transactions, and loans, as outlined in the data relationship diagram:
+
+- **Loan**: Loan details including amount, duration, and repayment status.
+- **Account**: Account-level details and linkage to districts.
+- **Disposition**: Links between clients and accounts.
+- **Transactions**: Transaction-level details like amounts and balance.
+- **District**: Demographic and geographic information.
+- **Client**: Personal details of clients.
+- **Order**: Recurring payment details including recipient bank, account, amount, and purpose.
+- **Card**: Credit card details including type and issuance date.
+
+By looking at the status variable in the Loan table, there are 4 distinct values: A, B, C, and D.
+A: Contract finished, no problems.
+B: Contract finished, loan not paid.
+C: Running contract, okay so far.
+D: Running contract, client in debt.
+
+These relationships allow us to integrate data for a comprehensive analysis.
+
+---
+
+## Step 1: Research Questions and Analysis
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, comment="", warning = FALSE, message = FALSE, tidy.opts=list(width.cutoff=55), tidy = TRUE)
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(lubridate)
+library(tidyr)
+library(readr) 
+library(e1071)
+library(pROC)
+library(DMwR2)
+library(ROSE)
+library(randomForest)
+library(knitr)
+library(gbm)
+library(corrplot)
+```
+
+```{r source}
+```
+
+```{r constants}
+```
+
+```{r functions}
+
+```
+
+```{r}
+account <- fread("data_berka/account.asc", sep = ";")
+card <- fread("data_berka/card.asc", sep = ";")
+client <- fread("data_berka/client.asc", sep = ";")
+disp <- fread("data_berka/disp.asc", sep = ";")
+district <- fread("data_berka/district.asc", sep = ";")
+loan <- fread("data_berka/loan.asc", sep = ";")
+order <- fread("data_berka/order.asc", sep = ";")
+trans <- fread("data_berka/trans.asc", sep = ";")
+
+```
+
+```{r}
+# Visualize loan status
+loan$status <- as.factor(loan$status)
+ggplot(loan, aes(x = status)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Loan Status Distribution", x = "Status", y = "Count")
+```
+
+### Data Preprocessing
+
+Prepare the dataset for analysis by cleaning, merging, and engineering relevant features.
+Ensure all variables are in the proper format for visualizations and modeling.
+
+```{r}
+# Clean `loan` dataset (convert date)
+loan[, date := as.Date(as.character(date), format = "%y%m%d")]
+
+# Aggregate transaction data to create summary features
+trans_summary <- trans[, .(
+  avg_balance = mean(balance, na.rm = TRUE),
+  overdraft_count = sum(balance < 0, na.rm = TRUE),
+  avg_trans_amount = mean(amount, na.rm = TRUE),
+  total_transactions = .N
+), by = account_id]
+
+# Aggregate order features
+order_summary <- order[, .(avg_order_amount = mean(amount, na.rm = TRUE)), by = account_id]
+
+
+# Merge datasets
+loan_data <- merge(loan, account, by = "account_id", all.x = TRUE)
+loan_data <- merge(loan_data, trans_summary, by = "account_id", all.x = TRUE)
+loan_data <- merge(loan_data, order_summary, by = "account_id", all.x = TRUE)
+
+# Replace missing values
+loan_data[is.na(avg_balance), avg_balance := 0]
+loan_data[is.na(overdraft_count), overdraft_count := 0]
+```
+
+
+### Q1: Are larger loan amounts and longer durations associated with higher default risks?
+
+Understanding whether larger loan amounts and longer durations increase default risks helps banks manage credit risk effectively. This insight allows for better loan structuring, risk-based pricing, and targeted interventions to minimize losses while ensuring borrowers can manage their repayment obligations.
+
+
+```{r}
+# Visualize Loan Amount and Default Status
+
+loan_data$status <- as.factor(loan_data$status)
+
+# Plot loan amount vs. loan status
+ggplot(loan_data, aes(x = status, y = amount, fill = status)) +
+  geom_boxplot() +
+  labs(
+    title = "Loan Amount vs. Default Status",
+    x = "Loan Status",
+    y = "Loan Amount"
+  ) +
+  theme_minimal()
+```
+
+
+#### Observation: 
+Status A (Contract finished, no problems):
+These loans have the smallest median loan amounts, indicating borrowers with smaller loans are more likely to pay them off without issues.
+
+Status B (Contract finished, loan not paid):
+Median loan amounts are slightly higher than Status A, indicating borrowers with unpaid loans at contract completion might have taken larger loans.
+
+Status C (Running contract, okay so far):
+Median loan amounts are higher than Status A and B. Borrowers with ongoing contracts and no issues appear to handle moderate loan amounts effectively.
+
+Status D (Running contract, client in debt):
+These loans have the largest median loan amount and the widest range, showing that borrowers in debt are associated with significantly larger loan amounts.
+
+#### Conclusion:
+Larger loan amounts are associated with financial difficulties (Status D: running contracts with debt).
+
+Borrowers with smaller loans are more likely to pay off their loans successfully (Status A).
+
+```{r}
+
+# Analyze the relationship between loan duration and default status
+
+ggplot(loan_data, aes(x = status, y = duration, fill = status)) +
+  geom_boxplot() +
+  labs(
+    title = "Loan Duration vs. Default Status",
+    x = "Loan Status",
+    y = "Loan Duration (Months)"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+#### Observations:
+
+Status A (Contract finished, no problems):
+These loans have the shortest durations, indicating borrowers with shorter loan terms are more likely to complete their contracts successfully.
+
+Status B (Contract finished, loan not paid):
+Loan durations are slightly longer than Status A, indicating that longer contracts may contribute to repayment challenges.
+
+Status C (Running contract, okay so far):
+Median durations are longer than Status A and B. Borrowers with ongoing contracts and no issues are managing longer-term loans effectively.
+
+Status D (Running contract, client in debt):
+These loans have the longest durations, indicating that long-term loans are more likely to result in financial difficulties (e.g., debts).
+
+#### Conclusion:
+Shorter loan durations are associated with successful repayment (Status A).
+
+Longer loan durations are more likely to result in debt or financial difficulties (Status D).
+
+
+### Q2: How does a client's account balance affect their ability to repay loans on time?
+
+We can analyze the relationship between the average account balance and the loan status. Borrowers with lower balances are expected to struggle more with repayment, leading to higher chances of falling into debt.
+
+```{r}
+
+# Plot average balance vs. loan status
+ggplot(loan_data, aes(x = status, y = avg_balance, fill = status)) +
+  geom_boxplot() +
+  labs(
+    title = "Average Account Balance vs. Loan Status",
+    x = "Loan Status",
+    y = "Average Balance"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+# Summary statistics of avg_balance by loan status
+
+balance_summary <- loan_data[, .(
+  mean_balance = mean(avg_balance, na.rm = TRUE),
+  median_balance = median(avg_balance, na.rm = TRUE),
+  count = .N 
+), by = status]
+
+# Print the summary
+print(balance_summary)
+
+```
+
+
+#### Observations:
+The boxplot shows the distribution of average account balances (avg_balance) across different loan statuses (A, B, C, and D):
+
+Borrowers with status A (Contract finished, no problems) tend to have higher average balances compared to other statuses, indicating better financial health.
+
+Borrowers with status B (Contract finished, loan not paid) and status D (Running contract, client in debt) exhibit significantly lower balances, implying financial struggles.
+
+Borrowers with status C (Running contract, okay so far) have moderate average balances, which are higher than B and D but lower than A.
+
+#### Conclusion:
+A higher average account balance is correlated with better loan repayment outcomes (status A). Borrowers with low balances are more likely to miss payments or have ongoing financial difficulties (status B and D).
+
+This suggests that account balance is a strong indicator of a borrower's ability to meet loan repayment commitments. Financial institutions might consider incorporating account balance metrics into their credit risk assessment models to better predict loan repayment outcomes.
+
+
+### Q3: Does a history of frequent overdrafts increase the likelihood of default?
+
+We aim to analyze whether a history of frequent overdrafts serves as a reliable predictor of loan default risk, focusing on identifying patterns of financial instability. By examining the relationship between overdraft frequency and default outcomes, we seek to determine if this behavior can provide actionable insights for proactive risk assessment.
+
+```{r}
+# Plot overdraft count vs. loan status
+ggplot(loan_data, aes(x = status, y = overdraft_count, fill = status)) +
+  geom_boxplot() +
+  labs(
+    title = "Overdraft History vs. Loan Default",
+    x = "Loan Status",
+    y = "Overdraft Count"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# Summary statistics for overdraft count by loan status
+overdraft_summary_stats <- loan_data[, .(
+  mean_overdraft = mean(overdraft_count, na.rm = TRUE),
+  median_overdraft = median(overdraft_count, na.rm = TRUE),
+  count = .N
+), by = status]
+
+# Print the summary
+print(overdraft_summary_stats)
+
+```
+
+
+
+#### Observations:
+
+Status A (Contract finished, no problems):
+Borrowers with Status A have 0 overdraft counts. This indicates that these borrowers are financially disciplined, avoiding overdrafts entirely while managing their loans effectively.
+
+Status C (Running contract, okay so far):
+Borrowers with Status C also show 0 overdraft counts, implying they maintain financial stability during the loan term and are on track with their repayments.
+
+Status B (Contract finished, loan not paid):
+Borrowers with Status B have higher overdraft counts, with a median of 9 overdrafts and a mean of 13. This suggests a significant correlation between frequent overdrafts and loan repayment issues, as these borrowers failed to fully repay their loans.
+
+Status D (Running contract, client in debt):
+Borrowers with Status D also show frequent overdrafts, with a median of 7 and a mean of 13.3 overdrafts. This highlights that borrowers currently struggling with debt are likely to have a history of overdrafts.
+
+
+#### Conclusion:
+Mean and Median Overdrafts:
+Borrowers in Status B and D exhibit significantly higher overdraft counts compared to Status A and C. This supports the hypothesis that overdrafts are linked to repayment difficulties and financial instability.
+
+Count Distribution:
+Status C has the highest count (403), indicating that most borrowers are managing their loans well so far. In contrast, Status B and D have smaller borrower counts but higher overdraft averages, reinforcing their risk profile.
+
+
+## Step 2: Feature Engineering
+
+```{r}
+rm(list = ls())
+```
+
+```{r read_data}
+account_df <- fread("data_berka/account.asc", sep = ";")
+card_df <- fread("data_berka/card.asc", sep = ";")
+client_df <- fread("data_berka/client.asc", sep = ";")
+disp_df <- fread("data_berka/disp.asc", sep = ";")
+district_df <- fread("data_berka/district.asc", sep = ";")
+loan_df <- fread("data_berka/loan.asc", sep = ";")
+order_df <- fread("data_berka/order.asc", sep = ";")
+trans_df <- fread("data_berka/trans.asc", sep = ";")
+
+account_df <- as.data.table(account_df)
+card_df <- as.data.table(card_df)
+client_df <- as.data.table(client_df)
+disp_df <- as.data.table(disp_df)
+district_df <- as.data.table(district_df)
+loan_df <- as.data.table(loan_df)
+order_df <- as.data.table(order_df)
+trans_df <- as.data.table(trans_df)
+```
+
+### Loan Table
+
+In this part, we added a prefix to column names, converted loan_payments to Integer, formatted loan_date as a Date, and inspected the Data Frame.
+```{r}
+colnames(loan_df) <- paste0("loan_", colnames(loan_df))
+loan_df$loan_payments <- as.integer(loan_df$loan_payments)
+loan_df$loan_date <- as.Date(as.character(loan_df$loan_date), format = "%y%m%d")
+print(dim(loan_df))
+```
+
+### Account Table
+
+1. **Updated `frequency` Column**:
+   - Replaced values with descriptive labels: `"POPLATEK MESICNE"` → `"monthly"`, `"POPLATEK TYDNE"` → `"weekly"`, `"POPLATEK PO OBRATU"` → `"after_transaction"`.
+2. **Formatted `date` Column**:
+   - Converted `date` column to Date format using `%y%m%d`.
+3. **Renamed and Prefixed Columns**:
+   - Added `"acc_"` as a prefix to all column names in `account_df`.
+   - Renamed `loan_account_id` and `acc_account_id` to `account_id` for consistency.
+4. **Merged DataFrames**:
+   - Performed a left join of `loan_df` and `account_df` on `account_id`.
+5. **Calculated and Cleaned Columns**:
+   - Created `day_before_loan` as the difference (in days) between `loan_date` and `acc_date`.
+   - Removed the `acc_date` column.
+
+```{r}
+# Convert the frequency column values
+account_df$frequency[account_df$frequency == "POPLATEK MESICNE"] <- "monthly"
+account_df$frequency[account_df$frequency == "POPLATEK TYDNE"] <- "weekly"
+account_df$frequency[account_df$frequency == "POPLATEK PO OBRATU"] <- "after_transaction"
+
+# Convert the date column to Date format
+account_df$date <- as.Date(as.character(account_df$date), format = "%y%m%d")
+
+```
+
+```{r}
+# Add prefix to all column names
+colnames(account_df) <- paste0("acc_", colnames(account_df))
+
+print(dim(account_df))  
+```
+
+```{r}
+colnames(loan_df)
+colnames(account_df)
+
+```
+
+```{r}
+setnames(loan_df, old = "loan_account_id", new = "account_id")
+setnames(account_df, old = "acc_account_id", new = "account_id")
+
+# Perform the left join
+df <- merge(loan_df, account_df, by = "account_id", all.x = TRUE)
+
+# Calculate day_before_loan
+df[, day_before_loan := as.numeric(difftime(loan_date, acc_date, units = "days"))]
+
+df[, acc_date := NULL]
+
+print(dim(df)) 
+```
+
+### Manipulating k_symbol and joining Transaction table
+
+1. **Replaced Empty Strings**: Converted empty or space-filled values in `k_symbol` and `operation` columns to `NA`.
+2. **Updated Columns with Descriptive Labels**:
+   - `type`: Mapped "PRIJEM" to "credit" and "VYDAJ/VYBER" to "withdrawal".
+   - `k_symbol`: Translated values (e.g., "POJISTNE" → "insurance", "UVER" → "loan").
+   - `operation`: Mapped actions (e.g., "VYBER KARTOU" → "credit_card_withdrawal").
+3. **Formatted `date` Column**: Converted `date` to Date format (`%y%m%d`).
+4. **Checked Date Range**: Identified min and max dates in the dataset.
+
+```{r}
+# Replace empty strings or unexpected spaces with NA in the k_symbol column
+trans_df <- trans_df %>%
+  mutate(k_symbol = ifelse(trimws(k_symbol) == "" | k_symbol == " ", NA, k_symbol))
+
+# Replace empty strings or unexpected spaces with NA in the operation column
+trans_df <- trans_df %>%
+  mutate(operation = ifelse(trimws(operation) == "" | operation == " ", NA, operation))
+```
+
+```{r}
+
+# Update the `type` column to use descriptive names
+trans_df <- trans_df %>%
+  mutate(
+    type = case_when(
+      type == "PRIJEM" ~ "credit", 
+      type %in% c("VYDAJ", "VYBER") ~ "withdrawal",  
+      TRUE ~ type  
+    )
+  )
+
+# Check the updated `type` column
+trans_df %>% count(type)
+```
+
+```{r}
+# Update the `operation` column to use descriptive names
+trans_df <- trans_df %>%
+  mutate(
+    operation = case_when(
+      operation == "VYBER KARTOU" ~ "credit_card_withdrawal",  
+      operation == "VKLAD" ~ "credit_in_cash",  
+      operation == "PREVOD Z UCTU" ~ "collection_from_anotherbank",  
+      operation == "VYBER" ~ "withdrawal_in_cash",  
+      operation == "PREVOD NA UCET" ~ "remittance_to_anotherbank",  
+      TRUE ~ operation 
+    )
+  )
+
+# Check the updated `operation` column
+trans_df %>% count(operation)
+```
+
+```{r}
+# Update the `k_symbol` column to use descriptive names
+trans_df <- trans_df %>%
+  mutate(
+    k_symbol = case_when(
+      k_symbol == "POJISTNE" ~ "insurance",  
+      k_symbol == "SLUZBY" ~ "payment_for_statement",  
+      k_symbol == "UROK" ~ "interest_credited",  
+      k_symbol == "SANKC. UROK" ~ "sanction_interest_neg_bal",  
+      k_symbol == "SIPO" ~ "household",  
+      k_symbol == "DUCHOD" ~ "old-age_pension",  
+      k_symbol == "UVER" ~ "loan",  
+      TRUE ~ k_symbol  
+    )
+  )
+
+# Check the updated `k_symbol` column
+trans_df %>% count(k_symbol)
+```
+
+```{r}
+# Convert `date` column to Date format
+trans_df <- trans_df %>%
+  mutate(date = as.Date(as.character(date), format = "%y%m%d"))
+
+trans_df %>% summarise(min_date = min(date, na.rm = TRUE), max_date = max(date, na.rm = TRUE))
+```
+
+#### Creating Money in & Money out
+
+1. **Copied the Original Data**: Created a backup of `trans_df` as `trans_df_in`.
+2. **Defined a Helper Function**:
+   - Created `money_in_out` to segregate transaction amounts into `amount_in` and `amount_out` based on a specified column condition.
+3. **Applied Function**:
+   - Used `money_in_out` to calculate `amount_in` for "credit" transactions and `amount_out` for "withdrawal" transactions in `trans_df_in`.
+4. **Dropped Unnecessary Columns**:
+   - Removed `trans_id`, `bank`, and `account` columns from `trans_df_in`.
+   
+```{r}
+# Copy the original data frame
+trans_df_in <- trans_df
+
+# Define a helper function to segregate money_in and money_out
+money_in_out <- function(df, focus_colname, cond_colname, in_colname = "credit", out_colname = "withdrawal") {
+  df %>%
+    mutate(
+      amount_in = ifelse(!!sym(cond_colname) == in_colname, !!sym(focus_colname), 0),
+      amount_out = ifelse(!!sym(cond_colname) == out_colname, !!sym(focus_colname), 0)
+    )
+}
+
+# Apply the helper function to handle 'amount_in' and 'amount_out'
+trans_df_in <- money_in_out(trans_df_in, "amount", "type")
+
+head(trans_df_in)
+```
+
+```{r}
+trans_df_in <- trans_df_in %>%
+  select(-trans_id, -bank, -account)
+
+head(trans_df_in)
+```
+
+#### Focus on transactions before loan
+
+1. **Merged Transactions with Loans**:
+   - Performed a left join between `trans_df_in` and `loan_df` on `account_id` to include `loan_date`.
+2. **Calculated Time Difference**:
+   - Added a new column `day_after_loan`, representing the days between the transaction date (`date`) and the loan date (`loan_date`).
+3. **Split Transactions**:
+   - Filtered transactions into two subsets:
+     - `trans_df_before_loan`: Transactions occurring before the loan (`day_after_loan > 0`).
+     - `trans_df_after_loan`: Transactions occurring on or after the loan (`day_after_loan <= 0`).
+4. **Replaced Missing Values**:
+   - Updated `operation` and `k_symbol` columns, replacing `NA` with `"Others"`.
+5. **Filtered `k_symbol` Column**:
+   - Removed rows where `k_symbol` equals `"Others"` from `trans_df_in`.
+```{r}
+# Perform a left join to merge transactions with loans based on 'account_id'
+trans_df_before_loan <- trans_df_in %>%
+  left_join(
+    loan_df %>% select(account_id, loan_date), 
+    by = "account_id" 
+  ) %>%
+  mutate(
+    # Calculate the days between transaction date and loan date
+    day_after_loan = as.numeric(difftime(loan_date, date, units = "days"))
+  )
+
+# Filter transactions into those after and before the loan date
+trans_df_after_loan <- trans_df_before_loan %>%
+  filter(day_after_loan <= 0) 
+
+trans_df_before_loan <- trans_df_before_loan %>%
+  filter(day_after_loan > 0)  
+
+cat("Dimensions of transactions before loan:", dim(trans_df_before_loan), "\n")
+
+cat("Dimensions of transactions after loan:", dim(trans_df_after_loan), "\n")
+
+```
+
+
+```{r}
+trans_df_in <- trans_df_before_loan
+
+# Replace NA values in 'operation' and 'k_symbol' columns with 'Others'
+trans_df_in <- trans_df_in %>%
+  mutate(
+    operation = ifelse(is.na(operation), "Others", operation),
+    k_symbol = ifelse(is.na(k_symbol), "Others", k_symbol)
+  )
+```
+
+```{r}
+# Remove rows where 'k_symbol' is not equal to 'Others'
+trans_df_in <- trans_df_in %>%
+  filter(k_symbol != "Others")
+
+```
+
+#### one-hot encoding to k_symbol
+1. **Created Copy**:
+   - Made a copy of `trans_df_in` as `trans_df_`.
+2. **Performed One-Hot Encoding**:
+   - Encoded unique values of `k_symbol` into separate columns prefixed with `out_`.
+   - Filled missing combinations with `0`.
+3. **Renamed Encoded Column**:
+   - Renamed `out_interest_credited` to `in_interest_credited` to match its context.
+4. **Defined Outgoing Transaction Columns**:
+   - Selected specific outgoing transaction indicators (`out_household`, `out_insurance`, etc.).
+5. **Counted Sanction Interest**:
+   - Created a column `count_out_sanction_interest_neg_bal` to count occurrences of sanction interest for negative balances.
+6. **Calculated Outgoing Transaction Amounts**:
+   - Multiplied outgoing transaction indicators by `amount_out` for relevant columns.
+7. **Calculated Incoming Interest Amount**:
+   - Multiplied `in_interest_credited` by `amount_in`.
+
+```{r}
+# Make a copy of trans_df_in
+trans_df_ <- trans_df_in
+
+# Perform one-hot encoding for the 'k_symbol' column
+trans_df_ <- trans_df_ %>%
+  mutate(dummy = 1) %>% # Create a dummy column with a constant value to use for pivoting
+  pivot_wider(
+    names_from = k_symbol,     # Create one-hot columns from unique values in 'k_symbol'
+    names_prefix = "out_",     # Prefix the column names with 'out_'
+    values_from = dummy,       # Use the dummy column as the values
+    values_fill = list(dummy = 0) # Fill missing combinations with 0
+  )
+
+# Rename the one-hot encoded column 'out_interest_credited' to 'in_interest_credited'
+trans_df_ <- trans_df_ %>%
+  rename(in_interest_credited = out_interest_credited)
+
+```
+
+```{r}
+# Define the columns for outgoing transactions
+out_trans <- c("out_household", "out_insurance", "out_payment_for_statement", "out_sanction_interest_neg_bal")
+
+# Count sanction interest for negative balance
+trans_df_ <- trans_df_ %>%
+  mutate(count_out_sanction_interest_neg_bal = out_sanction_interest_neg_bal)
+
+# Multiply outgoing transaction indicators by `amount_out`
+trans_df_ <- trans_df_ %>%
+  mutate(across(all_of(out_trans), ~ . * amount_out, .names = "{.col}"))
+
+# Multiply `in_interest_credited` by `amount_in`
+trans_df_ <- trans_df_ %>%
+  mutate(in_interest_credited = in_interest_credited * amount_in)
+
+# Display the first few rows of the updated data frame
+head(trans_df_)
+```
+
+#### Perform monthly payment analysis
+
+1. **Selected Relevant Columns**:
+   - Extracted columns related to payment amounts, incoming and outgoing transactions, and transaction indicators.
+2. **Grouped and Summarized by `account_id`**:
+   - Calculated the sum of each column for each account using `group_by` and `summarise`.
+3. **Counted Monthly Transactions**:
+   - Created `count_monthly_trans` to count the number of transactions per account.
+4. **Merged Transaction Count**:
+   - Integrated the transaction count into the summarized monthly payment data.
+5. **Renamed Columns**:
+   - Renamed:
+     - `count_monthly_trans` → `count_monthly_payment_trans`
+     - `sum_count_out_sanction_interest_neg_bal` → `count_out_sanction_interest_neg_bal`
+
+```{r}
+# Select relevant columns for monthly payment analysis
+trans_monthly_payment <- trans_df_ %>%
+  select(
+    account_id, amount, amount_in, amount_out, 
+    out_household, out_insurance, in_interest_credited, 
+    out_payment_for_statement, out_sanction_interest_neg_bal, 
+    count_out_sanction_interest_neg_bal
+  )
+
+# Group by 'account_id' and calculate the sum for each account
+trans_monthly_payment <- trans_monthly_payment %>%
+  group_by(account_id) %>%
+  summarise(across(everything(), sum, .names = "sum_{.col}"), .groups = "drop")
+
+# Add a count of monthly transactions for each account
+count_monthly_trans <- trans_df_ %>%
+  group_by(account_id) %>%
+  summarise(count_monthly_trans = n(), .groups = "drop")
+
+# Merge the transaction count back into the monthly payment summary
+trans_monthly_payment <- trans_monthly_payment %>%
+  left_join(count_monthly_trans, by = "account_id")
+
+# Rename columns to align with desired naming conventions
+trans_monthly_payment <- trans_monthly_payment %>%
+  rename(
+    count_monthly_payment_trans = count_monthly_trans,
+    count_out_sanction_interest_neg_bal = sum_count_out_sanction_interest_neg_bal
+  )
+
+# View the final dataframe
+head(trans_monthly_payment)
+```
+
+#### Creating features for current monthly payments
+
+1. **Added a 'last_month' Column**:
+   - Created a column `last_month` as 31 days before the `loan_date`.
+2. **Filtered Recent Transactions**:
+   - Retained rows where the difference between `date` and `last_month` is >= 0, focusing on transactions within the last month.
+3. **Summarized Recent Transactions**:
+   - Selected and summed relevant columns (`amount_out`, `out_household`, `out_insurance`, etc.) grouped by `account_id`.
+4. **Renamed Columns**:
+   - Prefixed summarized columns with `current_monthly_payment_` for clarity.
+5. **Merged Summaries**:
+   - Performed a left join between `trans_monthly_payment` and `current_monthly_payment` on `account_id` to combine overall and recent monthly payment details.
+
+```{r}
+# Add a new column 'last_month' that is 31 days before 'loan_date'
+trans_df_ <- trans_df_ %>%
+  mutate(loan_date = as.Date(loan_date)) %>%
+  mutate(last_month = loan_date - days(31))
+
+# Filter rows where the difference between 'date' and 'last_month' is >= 0
+current_monthly_payment <- trans_df_ %>%
+  filter(as.numeric(difftime(date, last_month, units = "days")) >= 0) %>%
+  select(account_id, amount_out, out_household, out_insurance, out_payment_for_statement, in_interest_credited) %>%
+  group_by(account_id) %>%
+  summarise(across(everything(), sum, na.rm = TRUE), .groups = "drop")  # Summarise all selected numeric columns
+
+# Add a prefix to column names
+current_monthly_payment <- current_monthly_payment %>%
+  rename_with(~ paste0("current_monthly_payment_", .), -account_id)
+
+# View the resulting dataframe
+head(current_monthly_payment)
+```
+
+```{r}
+# Perform a left join between 'trans_monthly_payment' and 'current_monthly_payment' on 'account_id'
+trans_monthly_payment_summary <- trans_monthly_payment %>%
+  left_join(current_monthly_payment, by = "account_id")
+
+head(trans_monthly_payment_summary)
+```
+
+#### Joining the whole table with monthly payment analysis
+
+```{r}
+# Merge `df` with `trans_monthly_payment_summary` using a left join
+df <- df %>%
+  left_join(trans_monthly_payment_summary, by = "account_id") %>%
+  # Replace NA values with 0 across all columns
+  mutate(across(everything(), ~ replace_na(., 0)))
+```
+
+#### Creating new features for "other transactions"
+
+1. **Filtered Transactions with `k_symbol = "Others"`**:
+   - Replaced `NA` values in `operation` and `k_symbol` with `"Others"`.
+   - Filtered `trans_df_in` to retain rows where `k_symbol` equals `"Others"`.
+2. **Summarized Transactions**:
+   - Grouped by `account_id` and calculated:
+     - `sum_amount`: Total transaction amount.
+     - `sum_amount_in`: Total incoming amount.
+     - `sum_amount_out`: Total outgoing amount.
+     - `count_other_trans`: Number of "Others" transactions.
+   - Added prefix `sum_other_` to relevant columns for clarity.
+3. **Extracted Latest Balance**:
+   - Arranged `trans_df_before_loan` by `account_id` and `date`.
+   - Selected the latest transaction for each `account_id` and retained the `balance` column.
+4. **Integrated Latest Balance**:
+   - Performed a left join to add the latest balance for each account to the main DataFrame (`df`).
+   - Renamed the `balance` column in `df` to `latest_balance`.
+
+```{r}
+trans_df_in <- trans_df_before_loan
+
+# Replace NA values in 'operation' and 'k_symbol' columns with 'Others'
+trans_df_in <- trans_df_in %>%
+  mutate(
+    operation = ifelse(is.na(operation), "Others", operation),
+    k_symbol = ifelse(is.na(k_symbol), "Others", k_symbol)
+  )
+
+trans_df_in <- trans_df_in %>%
+  filter(k_symbol == "Others")
+
+# Summarize the data to compute the sum of `amount`, `amount_in`, and `amount_out` grouped by `account_id`
+trans_others <- trans_df_in %>%
+  group_by(account_id) %>%
+  summarise(
+    sum_amount = sum(amount, na.rm = TRUE),
+    sum_amount_in = sum(amount_in, na.rm = TRUE),
+    sum_amount_out = sum(amount_out, na.rm = TRUE),
+    count_other_trans = n() 
+  ) %>%
+  ungroup()  
+
+# Rename columns to add prefix `sum_other_` where appropriate
+trans_others <- trans_others %>%
+  rename_with(~ paste0("sum_other_", .), starts_with("sum_")) %>%
+  rename(count_other_trans = count_other_trans)  
+
+print(dim(trans_others))
+head(trans_others)
+```
+
+```{r}
+# Perform a left join to merge 'df' with 'trans_others' on 'account_id'
+df <- df %>%
+  left_join(trans_others, by = "account_id")
+
+```
+
+```{r}
+trans_df_before_loan <- trans_df_before_loan %>%
+  arrange(account_id, date)
+
+# Extract the latest balance for each account
+balance_latest <- trans_df_before_loan %>%
+  group_by(account_id) %>%
+  slice_tail(n = 1) %>%  
+  select(account_id, balance) 
+
+# Add the latest balance to the main dataframe 'df'
+df <- df %>%
+  left_join(balance_latest, by = "account_id") 
+
+# Rename 'balance' column to 'latest_balance' in df
+df <- df %>%
+  rename(latest_balance = balance)
+
+```
+
+
+#### Focus on balance analysis and creating new features
+
+ 1. **Date Adjustments**
+- Converted `date` and `loan_date` to Date format.
+- Added columns:
+  - `last_month_before_loan`: 31 days before `loan_date`.
+  - `last_3_months_before_loan`: 93 days before `loan_date`.
+
+ 2. **Balance Features**
+- **All-time Balance Features**:
+  - Calculated `balance_mean`, `balance_min`, and `balance_max` grouped by `account_id`.
+- **Last Month Balance Features**:
+  - Computed `balance_min_last_month`, `balance_max_last_month`, and `balance_mean_last_month`.
+- **Last 3 Months Balance Features**:
+  - Calculated `balance_min_last_3months`, `balance_max_last_3months`, and `balance_mean_last_3months`.
+- **Balance Growth Rate**:
+  - Calculated mean balance 3 months ago (`balance_mean_3months_ago`).
+  - Derived `growth_balance` as the difference between last month's mean and 3-months-ago mean, normalized by time.
+
+ 3. **Amount Features**
+- **Monthly and 3-Month Averages**:
+  - Computed total and average incoming, outgoing, and net transaction amounts for the last month and last 3 months.
+- **Ratios**:
+  - Derived transaction amounts per `loan_payments` and `loan_amount` for monthly and 3-month periods.
+
+ 4. **Merging Features**
+- Combined all features (`balance_features`, `last_month_balance`, `last_3months_balance`, `growth_balance`, and `amount_features`) into the main dataframe `df` using `account_id`.
+
+
+```{r}
+# Ensure dates are in the correct format for trans_df_before_loan
+trans_df_before_loan <- trans_df_before_loan %>%
+  mutate(
+    date = as.Date(date),
+    loan_date = as.Date(loan_date),
+    last_month_before_loan = loan_date - days(31),
+    last_3_months_before_loan = loan_date - days(31 * 3)
+  )
+
+# Step 1: Calculate all-time balance features
+balance_features <- trans_df_before_loan %>%
+  group_by(account_id) %>%
+  summarise(
+    balance_mean = mean(balance, na.rm = TRUE),
+    balance_min = min(balance, na.rm = TRUE),
+    balance_max = max(balance, na.rm = TRUE)
+  )
+
+# Step 2: Calculate last month's balance features
+last_month_balance <- trans_df_before_loan %>%
+  filter(date >= last_month_before_loan) %>%
+  group_by(account_id) %>%
+  summarise(
+    balance_min_last_month = min(balance, na.rm = TRUE),
+    balance_max_last_month = max(balance, na.rm = TRUE),
+    balance_mean_last_month = mean(balance, na.rm = TRUE)
+  )
+
+# Step 3: Calculate last 3 months' balance features
+last_3months_balance <- trans_df_before_loan %>%
+  filter(date >= last_3_months_before_loan) %>%
+  group_by(account_id) %>%
+  summarise(
+    balance_min_last_3months = min(balance, na.rm = TRUE),
+    balance_max_last_3months = max(balance, na.rm = TRUE),
+    balance_mean_last_3months = mean(balance, na.rm = TRUE)
+  )
+
+# Step 4: Calculate growth rate of balance over 3 months
+last_3months_ago <- trans_df_before_loan %>%
+  filter(
+    date > last_3_months_before_loan & 
+    date <= last_3_months_before_loan + days(31)
+  ) %>%
+  group_by(account_id) %>%
+  summarise(balance_mean_3months_ago = mean(balance, na.rm = TRUE))
+
+growth_balance <- last_month_balance %>%
+  left_join(last_3months_ago, by = "account_id") %>%
+  mutate(growth_balance = (balance_mean_last_month - balance_mean_3months_ago) / (30 * 3)) %>%
+  select(account_id, growth_balance)
+
+# Step 5: Calculate amount features (monthly and 3-month averages)
+amount_features <- trans_df_before_loan %>%
+  group_by(account_id) %>%
+  summarise(
+    last_month_amount = sum(amount[date >= last_month_before_loan], na.rm = TRUE),
+    last_month_in= sum(amount_in[date >= last_month_before_loan], na.rm = TRUE),
+    last_month_out = sum(amount_out[date >= last_month_before_loan], na.rm = TRUE),
+    last_3mo_avg = sum(amount[date >= last_3_months_before_loan], na.rm = TRUE) / 3,
+    last_3mo_in_avg = sum(amount_in[date >= last_3_months_before_loan], na.rm = TRUE) / 3,
+    last_3mo_out_avg = sum(amount_out[date >= last_3_months_before_loan], na.rm = TRUE) / 3
+  )
+
+# Step 6: Calculate ratios (amounts per loan payments and amounts per loan amount)
+amount_features <- amount_features %>%
+  left_join(df %>% select(account_id, loan_payments, loan_amount), by = "account_id") %>%
+  mutate(
+    Monthly_Amt_Per_Payment = last_month_amount / loan_payments,
+    Monthly_Amt_Per_Loan = last_month_amount / loan_amount,
+    Monthly_Inflow_Per_Loan =  last_month_in / loan_amount,
+    Monthly_Outflow_Per_Loan = last_month_out / loan_amount,
+    ThreeMonth_Amt_Per_Payment = last_3mo_avg / loan_payments,
+    ThreeMonth_Amt_Per_Loan = last_3mo_avg / loan_amount,
+    ThreeMonth_Inflow_Per_Loan = last_3mo_in_avg / loan_amount,
+    ThreeMonth_Outflow_Per_Loan = last_3mo_out_avg / loan_amount
+  )
+
+# Step 7: Merge all features into the main dataframe (df)
+df <- df %>%
+  left_join(balance_features, by = "account_id") %>%
+  left_join(last_month_balance, by = "account_id") %>%
+  left_join(last_3months_balance, by = "account_id") %>%
+  left_join(growth_balance, by = "account_id") %>%
+  left_join(amount_features, by = "account_id")
+```
+
+```{r}
+# Select the .x columns and remove their .y counterparts
+df <- df %>%
+  select(-loan_amount.y, -loan_payments.y) %>%
+  rename(
+    loan_amount = loan_amount.x,
+    loan_payments = loan_payments.x
+  )
+```
+
+### Creating and joining client information into the dataset, including disposition table and client table
+
+1. **Merging DataFrames**
+- **First Merge**:
+  - Combined `disp_df` with `client_df` using `client_id` as the key.
+- **Second Merge**:
+  - Merged the result with `card_df` using `disp_id` as the key.
+  
+2. **Gender and Birth Date Extraction**
+- Extracted `gender` from `birth_number`:
+  - Birth months > 50 indicate females (`F`), otherwise males (`M`).
+- Computed `birth_date` using year, month, and day extracted from `birth_number`.
+
+3. **Age Calculation**
+- Converted `birth_date` to Date format.
+- Defined `today` as `1999-01-01` and calculated `age` for each client.
+
+4. **Client Analysis**
+- Analyzed:
+  - Counts of clients by `client_type`.
+  - Counts of clients by `gender`.
+- Calculated account-level metrics:
+  - `all_client_mean_age`: Mean age of all clients for each `account_id`.
+  - `all_client_count`: Number of clients for each `account_id`.
+  
+5. **Filtering and Renaming**
+- Filtered rows for `client_type == "OWNER"` to focus on owners, who can issue permanent orders and loans.
+
+6. **One-Hot Encoding**
+- Replaced `NA` in `card_type` with `"unknown"`.
+- Performed one-hot encoding on `card_type`, creating dummy columns for each card type.
+
+  
+```{r}
+# First merge: Combine disp_df with client_df using "client_id" as the key
+dcc_df <- merge(disp_df, client_df, by = "client_id", all.x = TRUE)
+
+# Second merge: Combine the result with card_df using "disp_id" as the key
+dcc_df <- merge(dcc_df, card_df, by = "disp_id", all.x = TRUE) 
+
+setnames(dcc_df, old = c("type.x", "type.y", "issued"), 
+                  new = c("client_type", "card_type", "card_issued"))
+
+# Extract gender and normalize the birth month
+dcc_df[, gender := ifelse(birth_number %% 10000 %/% 100 > 50, "F", "M")]
+dcc_df[, birth_date := as.Date(
+  paste0(
+    1900 + floor(birth_number / 10000),
+    "-", 
+    sprintf("%02d", birth_number %% 10000 %/% 100 - ifelse(gender == "F", 50, 0)), # Extract and adjust month
+    "-", 
+    sprintf("%02d", birth_number %% 100) 
+  ), 
+  format = "%Y-%m-%d"
+)]
+
+dcc_df[, birth_number := NULL]
+
+head(dcc_df)
+```
+
+```{r}
+dcc_df[, birth_date := as.Date(birth_date, format = "%Y-%m-%d")]
+
+# Define today's date as "1999-01-01"
+today <- as.Date("1999-01-01", format = "%Y-%m-%d")
+
+# Calculate the 'age' column
+dcc_df[, age := as.integer(format(today, "%Y")) - as.integer(format(birth_date, "%Y"))]
+dcc_df[, c("disp_id", "birth_date", "district_id", "card_id") := NULL]
+
+head(dcc_df)
+```
+
+```{r}
+# Calculate the mean age of all clients grouped by account_id
+dcc_df[, all_client_mean_age := mean(age, na.rm = TRUE), by = account_id]
+
+# Calculate the count of all clients grouped by account_id
+dcc_df[, all_client_count := .N, by = account_id]
+
+# Filter rows where client_type is 'OWNER'
+# Only owner can issue permanent orders and ask for a loan
+dcc_df_ <- dcc_df[client_type == "OWNER"]
+
+```
+
+```{r}
+dcc_df_[, c("client_id", "client_type", "card_issued") := NULL]
+setnames(dcc_df_, old = c("gender", "age"), new = c("client_gender", "client_age"))
+
+```
+
+```{r}
+library(fastDummies)
+
+dcc_df_ <- as.data.table(dcc_df_)
+
+# Replace NA in 'card_type' with a placeholder before one-hot encoding
+dcc_df_[is.na(card_type), card_type := "unknown"]
+
+# Perform one-hot encoding for 'card_type'
+dcc_df_final <- dummy_cols(
+  dcc_df_,
+  select_columns = "card_type",
+  remove_selected_columns = TRUE, 
+  remove_first_dummy = FALSE       # Keep all dummy columns, including "unknown" if present
+)
+
+dcc_df_final[, card_type_unknown := NULL]
+
+```
+
+```{r}
+df <- merge(df, dcc_df_final, by = "account_id", all.x = TRUE)
+```
+
+### Processing table based on geographical informaiton
+1. **District Data Preparation**
+
+- **Numerical Conversion**:
+  - Converted `A12`, `A13`, and `A15` to numeric types.
+- **Feature Engineering**:
+  - Created `unemploy_rate` as the mean of columns `A12` and `A13`.
+  - Created `number_crimes` as the mean of columns `A15` and `A16`.
+  - Updated `A10` by dividing it by 100 to reflect the urban rate.
+- **Feature Renaming**:
+- **Final Dataset**:
+  - Merged calculated features (`unemploy_rate`, `number_crimes`) into the selected district features dataset.
+
+2. **Merging District Data with Main Data**
+- Renamed `acc_district_id` in `df` to `district_id`.
+- Performed a left join to merge `df` with `district_df_` based on `district_id`.
+
+3. **Loan Data Consolidation**
+- **Handling Missing Values**:
+  - Replaced `NA` values in numerical columns (`avg_balance`, `overdraft_count`, etc.) with `0`.
+- **Target Variable Creation**
+- **Column Cleanup**:
+  - Dropped unnecessary columns
+
+
+
+```{r}
+setnames(district_df, old = "A1", new = "district_id")
+```
+
+```{r}
+selected_district_feature <- c("district_id", "A4", "A10", "A11", "A14")
+district_df_ <- district_df[, ..selected_district_feature]  
+
+district_df[, A12 := as.numeric(A12)]
+district_df[, A13 := as.numeric(A13)]
+district_df[, A15 := as.numeric(A15)]
+
+district_df[, unemploy_rate := rowMeans(.SD, na.rm = TRUE), .SDcols = c("A12", "A13")]
+district_df[, number_crimes := rowMeans(.SD, na.rm = TRUE), .SDcols = c("A15", "A16")]
+
+# Update 'A10' to be divided by 100 (convert to urban rate)
+district_df_[, A10 := A10 / 100]
+
+calculated_cols <- district_df[, .(district_id, unemploy_rate, number_crimes)]
+
+district_df_ <- merge(district_df_, calculated_cols, by = "district_id", all.x = TRUE)
+
+setnames(
+  district_df_, 
+  old = c("A4", "A10", "A11", "A14"), 
+  new = c("num_inhabitants", "urban_rate", "avg_salary", "num_enterpreneurs_per1000inhabitants")
+)
+
+```
+
+```{r}
+df <- df %>%
+  rename(district_id = acc_district_id)
+```
+
+```{r}
+# Perform a left join to merge `df` with `district_df_` based on `district_id`
+final_df <- df %>%
+  left_join(district_df_, by = "district_id") %>%
+  select(-loan_loan_id, -loan_date, -district_id)  
+
+```
+
+
+### Data preparation: filtering dataset and feature seleciton
+
+```{r}
+
+binary_data <- final_df[loan_status %in% c("B", "D")]
+binary_data[, loan_status := as.numeric(loan_status == "D")]
+
+
+all_features <- binary_data[, !("loan_status"), with = FALSE]
+
+all_features <- data.table::setDF(all_features) 
+all_features <- data.table::setDT(lapply(all_features, as.numeric))
+
+valid_columns <- colnames(all_features)[sapply(all_features, function(x) {
+  !all(is.na(x)) && length(unique(x)) > 1
+})]
+
+all_features <- all_features[, ..valid_columns]
+
+# Calculate correlation matrix
+correlation_with_target <- sapply(all_features, function(x) cor(x, binary_data$loan_status, use = "complete.obs"))
+correlation_with_target_sorted <- sort(abs(correlation_with_target), decreasing = TRUE)
+
+
+top_15_features <- head(correlation_with_target_sorted, 15)
+print(top_15_features)
+
+```
+
+#### Create dataset with filtered features and data partition
+
+```{r}
+library(ggplot2)
+correlation_df <- data.frame(
+  Feature = names(top_15_features),
+  Correlation = top_15_features
+)
+
+ggplot(correlation_df, aes(x = reorder(Feature, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 15 Features Correlated with Loan Status", x = "Features", y = "Correlation")
+  
+  # Filter dataset with selected top 15 features
+selected_features <- c(names(top_15_features), "loan_status")
+
+# Filter dataset with selected features
+binary_data_filtered <- binary_data[, ..selected_features]
+```
+
+## Step 3: Model Development
+```{r}
+# Split data into training and testing sets
+set.seed(123)
+train_index <- createDataPartition(binary_data_filtered$loan_status, p = 0.7, list = FALSE)
+train_data <- binary_data_filtered[train_index]
+test_data <- binary_data_filtered[-train_index]
+```
+
+
+```{r}
+model_results <- data.frame(
+  Model = character(),
+  Accuracy = numeric(),
+  AUC = numeric(),
+  stringsAsFactors = FALSE
+)
+```
+
+### GBM model
+```{r}
+# Train GBM model with cross-validation
+gbm_model <- gbm(
+  formula = loan_status ~ .,           
+  data = train_data,
+  distribution = "bernoulli",          
+  n.trees = 100,                      
+  interaction.depth = 3,               
+  shrinkage = 0.01,                   
+  n.minobsinnode = 10,                
+  cv.folds = 5,                        
+  verbose = TRUE                       
+)
+
+# Best number of trees based on cross-validation
+best_iter <- gbm.perf(gbm_model, method = "cv")
+
+cat("Best number of trees based on CV: ", best_iter, "\n")
+
+# Predictions on test data using the optimal number of trees
+predictions <- predict(gbm_model, test_data, n.trees = best_iter, type = "response")
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+
+# Confusion matrix and accuracy
+conf_matrix <- table(Predicted = predicted_classes, Actual = test_data$loan_status)
+print(conf_matrix)
+
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("Accuracy: ", accuracy, "\n")
+
+# ROC Curve and AUC
+library(pROC)
+roc_curve <- roc(test_data$loan_status, predictions)
+plot(roc_curve, main = "ROC Curve")
+auc_value <- auc(roc_curve)
+cat("AUC: ", auc_value, "\n")
+
+# Feature Importance
+gbm_importance <- summary(gbm_model, plotit = FALSE)
+
+importance_df <- data.frame(
+  Feature = rownames(gbm_importance),
+  RelativeInfluence = gbm_importance$rel.inf
+)
+
+top_features <- importance_df[order(-importance_df$RelativeInfluence), ][1:10, ]
+
+# Visualize top features
+library(ggplot2)
+ggplot(top_features, aes(x = RelativeInfluence, y = reorder(Feature, RelativeInfluence))) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Top 10 Feature Importance (GBM Model)",
+    x = "Relative Influence",
+    y = "Feature"
+  ) +
+  theme(
+    axis.text.y = element_text(size = 10),  
+    plot.title = element_text(hjust = 0.5) 
+  )
+
+# Store results
+gbm_accuracy <- accuracy
+gbm_auc <- auc_value
+model_results <- rbind(model_results, c("GBM (CV)", gbm_accuracy, gbm_auc))
+
+
+```
+### ROSE
+```{r}
+# Increase sample size with ROSE
+train_data_rose <- ROSE(
+  loan_status ~ ., 
+  data = train_data, 
+  seed = 123, 
+  N = 400 
+)$data
+
+# Check class distribution after ROSE
+table(train_data_rose$loan_status)
+```
+
+
+### GLM with Random Oversampling
+```{r}
+# Build the GLM model using the ROSE-processed training data
+glm_model_rose <- glm(
+  loan_status ~ .,               
+  data = train_data_rose,       
+  family = binomial(link = "logit")  
+)
+
+
+summary(glm_model_rose)
+
+
+glm_predictions_rose <- predict(glm_model_rose, test_data, type = "response")
+glm_predicted_classes_rose <- ifelse(glm_predictions_rose > 0.5, 1, 0)
+
+conf_matrix_rose <- table(Predicted = glm_predicted_classes_rose, Actual = test_data$loan_status)
+cat("Confusion Matrix:\n")
+print(conf_matrix_rose)
+
+# Calculate Accuracy
+accuracy_rose <- sum(diag(conf_matrix_rose)) / sum(conf_matrix_rose)
+cat("Accuracy: ", accuracy_rose, "\n")
+
+# Generate ROC Curve
+roc_curve_rose <- roc(test_data$loan_status, glm_predictions_rose)
+plot(roc_curve_rose, main = "ROC Curve (GLM after ROSE)", col = "blue", lwd = 2)
+abline(a = 0, b = 1, col = "red", lty = 2)  # Diagonal reference line
+auc_value_rose <- auc(roc_curve_rose)
+cat("AUC: ", auc_value_rose, "\n")
+
+
+glm_accuracy_rose <- accuracy_rose
+glm_auc_rose <- auc_value_rose
+model_results <- rbind(model_results, c("GLM with Random Oversampling", glm_accuracy_rose, glm_auc_rose))
+```
+
+####Naive bayes with Random Oversampling
+```{r}
+# Train the Naive Bayes model using the ROSE-processed training data
+nb_model_rose <- naiveBayes(
+  loan_status ~ .,         
+  data = train_data_rose   
+)
+
+nb_predictions_rose <- predict(nb_model_rose, test_data, type = "raw")
+nb_predicted_classes_rose <- ifelse(nb_predictions_rose[, 2] > 0.5, 1, 0)
+
+conf_matrix_rose <- table(Predicted = nb_predicted_classes_rose, Actual = test_data$loan_status)
+cat("Confusion Matrix:\n")
+print(conf_matrix_rose)
+
+# Calculate Accuracy
+accuracy_rose <- sum(diag(conf_matrix_rose)) / sum(conf_matrix_rose)
+cat("Accuracy: ", accuracy_rose, "\n")
+
+# Generate ROC curve
+nb_roc_curve_rose <- roc(test_data$loan_status, nb_predictions_rose[, 2])
+plot(nb_roc_curve_rose, main = "ROC Curve (Naive Bayes after ROSE)", col = "blue", lwd = 2)
+abline(a = 0, b = 1, col = "red", lty = 2)  # Diagonal reference line
+auc_value_rose <- auc(nb_roc_curve_rose)
+cat("AUC: ", auc_value_rose, "\n")
+
+
+nb_accuracy_rose <- accuracy_rose
+nb_auc_rose <- auc_value_rose
+model_results <- rbind(model_results, c("Naive Bayes with Random Oversampling", nb_accuracy_rose, nb_auc_rose))
+
+```
+
+### Random forest with Random Oversampling
+```{r}
+train_data_rose$loan_status <- as.factor(train_data_rose$loan_status)
+test_data$loan_status <- as.factor(test_data$loan_status)
+# Train the Random Forest model
+rf_model_rose <- randomForest(
+  loan_status ~ .,         
+  data = train_data_rose,  
+  ntree = 100,             
+  mtry = 3,                
+  importance = TRUE        
+)
+
+print(rf_model_rose)
+
+top_features <- importance(rf_model_rose)
+top_features <- top_features[order(top_features[, 1], decreasing = TRUE), ]
+top_10_features <- head(top_features, 10)
+
+
+rf_predictions_rose <- predict(rf_model_rose, test_data, type = "response")
+
+conf_matrix_rose <- table(Predicted = rf_predictions_rose, Actual = test_data$loan_status)
+cat("Confusion Matrix:\n")
+print(conf_matrix_rose)
+
+# Calculate Accuracy
+accuracy_rose <- sum(diag(conf_matrix_rose)) / sum(conf_matrix_rose)
+cat("Accuracy: ", accuracy_rose, "\n")
+
+rf_probabilities_rose <- predict(rf_model_rose, test_data, type = "prob")[, 2]
+
+# Generate ROC curve
+rf_roc_curve_rose <- roc(test_data$loan_status, rf_probabilities_rose)
+plot(rf_roc_curve_rose, main = "ROC Curve (Random Forest after ROSE)", col = "blue", lwd = 2)
+abline(a = 0, b = 1, col = "red", lty = 2)  # Diagonal reference line
+auc_value_rose <- auc(rf_roc_curve_rose)
+cat("AUC: ", auc_value_rose, "\n")
+
+rf_accuracy_rose <- accuracy_rose
+rf_auc_rose <- auc_value_rose
+model_results <- rbind(model_results, c("Random Forest with Random Oversampling", rf_accuracy_rose, rf_auc_rose))
+
+```
+
+### GLM with grid search
+```{r}
+train_data[, loan_status := factor(loan_status, labels = c("UnpaidFinished", "ActiveInDebt"))]
+test_data[, loan_status := factor(loan_status, labels = c("UnpaidFinished", "ActiveInDebt"))]
+# Prepare a grid of hyperparameters for glmnet (elastic net)
+glmnet_grid <- expand.grid(
+  alpha = c(0, 0.5, 1),            
+  lambda = seq(0.01, 0.1, by = 0.01)  
+)
+
+# Set up cross-validation
+control <- trainControl(
+  method = "cv", 
+  number = 5, 
+  classProbs = TRUE, 
+  summaryFunction = twoClassSummary
+)
+
+# Train glmnet model
+glmnet_model <- train(
+  loan_status ~ ., 
+  data = train_data, 
+  method = "glmnet", 
+  trControl = control, 
+  tuneGrid = glmnet_grid, 
+  metric = "ROC"
+)
+
+# Calculate probabilities for AUC calculation
+glmnet_predictions_prob <- predict(glmnet_model, newdata = test_data, type = "prob")[, 2]  
+
+# Ensure the predictions are factors for the confusion matrix
+glmnet_predictions <- predict(glmnet_model, newdata = test_data)
+glmnet_predictions <- factor(glmnet_predictions, levels = levels(test_data$loan_status))
+
+# Confusion Matrix and Accuracy
+glmnet_conf_matrix <- confusionMatrix(glmnet_predictions, test_data$loan_status)
+accuracy_glmnet <- glmnet_conf_matrix$overall['Accuracy']
+
+cat("Accuracy (GLMNET): ", accuracy_glmnet, "\n")
+
+# ROC and AUC
+library(pROC)
+roc_curve_glmnet <- roc(test_data$loan_status, glmnet_predictions_prob)
+auc_value_glmnet <- auc(roc_curve_glmnet)
+
+cat("AUC (GLMNET): ", auc_value_glmnet, "\n")
+
+plot(roc_curve_glmnet, main = "ROC Curve (GLMNET Model)", col = "blue", lwd = 2)
+abline(a = 0, b = 1, col = "red", lty = 2)  
+
+# Store results in the specified format
+glmnet_accuracy <- as.numeric(accuracy_glmnet)
+glmnet_auc <- as.numeric(auc_value_glmnet)
+model_results <- rbind(model_results, c("GLMNET (Grid Search)", glmnet_accuracy, glmnet_auc))
+
+```
+
+
+### Model evaluation
+```{r}
+kable(model_results, col.names = c("Model", "Accuracy", "ROC AUC"), align = "c", caption = "Model Performance Comparison")
+```
+
+
+
+
