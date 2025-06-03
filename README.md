@@ -15,9 +15,9 @@ Recommend strategies to improve risk assessment, operational efficiency, and fai
 Sourced from the PKDD'99 Discovery Challenge, the dataset contains:
 1. account.asc: Account information
 2. client.asc: Client demographics
-loan.asc: Loan records
-trans.asc: Transactions
-card.asc, disp.asc, order.asc, district.asc: Supplementary data
+3. loan.asc: Loan records
+4. trans.asc: Transactions
+5. card.asc, disp.asc, order.asc, district.asc: Supplementary data
 
 ## Data Integration
 
@@ -38,17 +38,16 @@ Derived frequency of overdrafts and monthly payment patterns
 
 ### Models Developed
 
-Generalized Linear Model (GLM)
-GLM with ROSE (for balancing class distribution)
-Naïve Bayes with ROSE
-Random Forest with ROSE
-Gradient Boosting Machine (GBM)
+1. Generalized Linear Model (GLM)
+2. GLM with ROSE (for balancing class distribution)
+3. Naïve Bayes with ROSE
+4. Random Forest with ROSE
+5. Gradient Boosting Machine (GBM)
 
 ### Evaluation Metrics
-Accuracy
-
-AUC (Area Under the ROC Curve)
-Confusion Matrix
+1. Accuracy
+2. AUC (Area Under the ROC Curve)
+3. Confusion Matrix
 
 
 ### Key Findings
